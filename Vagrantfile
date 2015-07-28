@@ -1,47 +1,143 @@
 # -*- mode: ruby -*-
-# vi: set ft=ruby :
+# # vi: set ft=ruby :
 
+require 'fileutils'
 
-Vagrant.configure(2) do |config|
-  
-  # Enable provisioning with a shell script. Additional provisioners such as
-  # Puppet, Chef, Ansible, Salt, and Docker are also available. Please see the
-  # documentation for more information about their specific syntax and use.
-  config.vm.provision "shell", inline: <<-SHELL
-    apt-get autoremove -y
-    wget -qO- https://get.docker.com/ | sh
-    sudo usermod -aG docker vagrant
-    curl -L https://github.com/docker/compose/releases/download/1.3.1/docker-compose-`uname -s`-`uname -m` > /usr/local/bin/docker-compose
-    chmod +x /usr/local/bin/docker-compose
-  SHELL
-   
-  config.vm.define "lb" do |lb|
-    lb.vm.box = "ubuntu/trusty64"
-    lb.vm.network "private_network", ip: "192.168.50.101"
-    lb.vm.provision "shell", inline: "sudo docker pull nginx:latest"
-    lb.vm.provision "shell", inline: "cd /vagrant/nginx && docker-compose up -d"
+Vagrant.require_version ">= 1.6.0"
+
+CLOUD_CONFIG_PATH = File.join(File.dirname(__FILE__), "user-data")
+CONFIG = File.join(File.dirname(__FILE__), "config.rb")
+
+# Defaults for config options defined in CONFIG
+$num_instances = 1
+$instance_name_prefix = "core"
+$update_channel = "alpha"
+$image_version = "current"
+$enable_serial_logging = false
+$share_home = false
+$vm_gui = false
+$vm_memory = 1024
+$vm_cpus = 1
+$shared_folders = {}
+$forwarded_ports = {}
+
+# Attempt to apply the deprecated environment variable NUM_INSTANCES to
+# $num_instances while allowing config.rb to override it
+if ENV["NUM_INSTANCES"].to_i > 0 && ENV["NUM_INSTANCES"]
+  $num_instances = ENV["NUM_INSTANCES"].to_i
+end
+
+if File.exist?(CONFIG)
+  require CONFIG
+end
+
+# Use old vb_xxx config variables when set
+def vm_gui
+  $vb_gui.nil? ? $vm_gui : $vb_gui
+end
+
+def vm_memory
+  $vb_memory.nil? ? $vm_memory : $vb_memory
+end
+
+def vm_cpus
+  $vb_cpus.nil? ? $vm_cpus : $vb_cpus
+end
+
+Vagrant.configure("2") do |config|
+  # always use Vagrants insecure key
+  config.ssh.insert_key = false
+
+  config.vm.box = "coreos-%s" % $update_channel
+  if $image_version != "current"
+      config.vm.box_version = $image_version
   end
+  config.vm.box_url = "http://%s.release.core-os.net/amd64-usr/%s/coreos_production_vagrant.json" % [$update_channel, $image_version]
 
-  config.vm.define "engine1" do |engine1|
-    engine1.vm.box = "ubuntu/trusty64"
-    engine1.vm.network "private_network", ip: "192.168.50.102"
-    engine1.vm.provider "virtualbox" do |v|
-      v.memory = 1024
+  ["vmware_fusion", "vmware_workstation"].each do |vmware|
+    config.vm.provider vmware do |v, override|
+      override.vm.box_url = "http://%s.release.core-os.net/amd64-usr/%s/coreos_production_vagrant_vmware_fusion.json" % [$update_channel, $image_version]
     end
-    engine1.vm.provision "shell", inline: "sudo docker pull iojs:latest"
-    engine1.vm.provision "shell", inline: "sudo docker pull mongo:latest"
-    engine1.vm.provision "shell", inline: "sudo docker pull redis:latest"
   end
-  
-  config.vm.define "engine2" do |engine2|
-    engine2.vm.box = "ubuntu/trusty64"
-    engine2.vm.network "private_network", ip: "192.168.50.103"
-    engine2.vm.provider "virtualbox" do |v|
-      v.memory = 1024
+
+  config.vm.provider :virtualbox do |v|
+    # On VirtualBox, we don't have guest additions or a functional vboxsf
+    # in CoreOS, so tell Vagrant that so it can be smarter.
+    v.check_guest_additions = false
+    v.functional_vboxsf     = false
+  end
+
+  # plugin conflict
+  if Vagrant.has_plugin?("vagrant-vbguest") then
+    config.vbguest.auto_update = false
+  end
+
+  (1..$num_instances).each do |i|
+    config.vm.define vm_name = "%s-%02d" % [$instance_name_prefix, i] do |config|
+      config.vm.hostname = vm_name
+      config.vm.synced_folder ".", "/home/core/share", id: "core", :nfs => true,  :mount_options   => ['nolock,vers=3,udp']
+      if $enable_serial_logging
+        logdir = File.join(File.dirname(__FILE__), "log")
+        FileUtils.mkdir_p(logdir)
+
+        serialFile = File.join(logdir, "%s-serial.txt" % vm_name)
+        FileUtils.touch(serialFile)
+
+        ["vmware_fusion", "vmware_workstation"].each do |vmware|
+          config.vm.provider vmware do |v, override|
+            v.vmx["serial0.present"] = "TRUE"
+            v.vmx["serial0.fileType"] = "file"
+            v.vmx["serial0.fileName"] = serialFile
+            v.vmx["serial0.tryNoRxLoss"] = "FALSE"
+          end
+        end
+
+        config.vm.provider :virtualbox do |vb, override|
+          vb.customize ["modifyvm", :id, "--uart1", "0x3F8", "4"]
+          vb.customize ["modifyvm", :id, "--uartmode1", serialFile]
+        end
+      end
+
+      if $expose_docker_tcp
+        config.vm.network "forwarded_port", guest: 2375, host: ($expose_docker_tcp + i - 1), auto_correct: true
+      end
+
+      $forwarded_ports.each do |guest, host|
+        config.vm.network "forwarded_port", guest: guest, host: host, auto_correct: true
+      end
+
+      ["vmware_fusion", "vmware_workstation"].each do |vmware|
+        config.vm.provider vmware do |v|
+          v.gui = vm_gui
+          v.vmx['memsize'] = vm_memory
+          v.vmx['numvcpus'] = vm_cpus
+        end
+      end
+
+      config.vm.provider :virtualbox do |vb|
+        vb.gui = vm_gui
+        vb.memory = vm_memory
+        vb.cpus = vm_cpus
+      end
+
+      ip = "172.17.8.#{i+100}"
+      config.vm.network :private_network, ip: ip
+
+      # Uncomment below to enable NFS for sharing the host machine into the coreos-vagrant VM.
+      #config.vm.synced_folder ".", "/home/core/share", id: "core", :nfs => true, :mount_options => ['nolock,vers=3,udp']
+      $shared_folders.each_with_index do |(host_folder, guest_folder), index|
+        config.vm.synced_folder host_folder.to_s, guest_folder.to_s, id: "core-share%02d" % index, nfs: true, mount_options: ['nolock,vers=3,udp']
+      end
+
+      if $share_home
+        config.vm.synced_folder ENV['HOME'], ENV['HOME'], id: "home", :nfs => true, :mount_options => ['nolock,vers=3,udp']
+      end
+
+      if File.exist?(CLOUD_CONFIG_PATH)
+        config.vm.provision :file, :source => "#{CLOUD_CONFIG_PATH}", :destination => "/tmp/vagrantfile-user-data"
+        config.vm.provision :shell, :inline => "mv /tmp/vagrantfile-user-data /var/lib/coreos-vagrant/", :privileged => true
+      end
+
     end
-    engine2.vm.provision "shell", inline: "sudo docker pull iojs:latest"
-    engine2.vm.provision "shell", inline: "sudo docker pull mongo:latest"
-    engine2.vm.provision "shell", inline: "sudo docker pull redis:latest"
   end
-  
 end
